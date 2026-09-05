@@ -1,325 +1,289 @@
-import time
+"""Streamlit operations dashboard for the synthetic DSAS pipeline."""
+
+from __future__ import annotations
+
+from datetime import datetime
+from typing import Any
+
 import numpy as np
 import pandas as pd
-import scipy.signal as signal
-import plotly.graph_objects as go
 import plotly.express as px
+import plotly.graph_objects as go
+import scipy.signal as signal
 import streamlit as st
 
-# ==========================================
-# PAGE CONFIGURATION
-# ==========================================
+from scanner import HAS_CLASSIFIER, scan_and_prioritize
+from simulator import generate_spectrum_batch
+
+
 st.set_page_config(
-    page_title="Defensive Spectrum Awareness System",
-    page_icon="📡",
+    page_title="Defensive Spectrum-Awareness System",
+    page_icon="🛡️",
     layout="wide",
-    initial_sidebar_state="expanded"
+    initial_sidebar_state="expanded",
 )
 
-# ==========================================
-# MODULE INTEGRATION WITH FALLBACK ENGINE
-# ==========================================
-try:
-    from simulator import generate_spectrum_batch
-    from scanner import scan_and_prioritize
-    from classifier import classify_channel
-    HAS_CUSTOM_MODULES = True
-except ImportError:
-    HAS_CUSTOM_MODULES = False
+
+def _new_scan(threshold_db: float) -> tuple[dict[int, dict[str, Any]], pd.DataFrame]:
+    """Generate and analyze one complete synthetic spectrum sweep."""
+
+    channels = generate_spectrum_batch(num_channels=10)
+    analysis = scan_and_prioritize(channels, threshold_db=threshold_db)
+    return channels, analysis
 
 
-def fallback_generate_spectrum(num_channels=10, num_samples=1024, sample_rate=1e6):
-    """Generates synthetic IQ data across multiple frequency channels."""
-    channels = {}
-    t = np.arange(num_samples) / sample_rate
-    
-    for ch in range(num_channels):
-        noise = (np.random.randn(num_samples) + 1j * np.random.randn(num_samples)) * 0.1
-        rand_val = np.random.rand()
-        
-        if rand_val < 0.45:
-            sig_type = "Background Noise"
-            iq = noise
-        elif rand_val < 0.70:
-            sig_type = "Civilian Broadcast"
-            iq = np.exp(1j * 2 * np.pi * 50e3 * t) * 0.8 + noise
-        elif rand_val < 0.88:
-            sig_type = "Hostile Radar"
-            pulse_mask = (t * 1e4).astype(int) % 10 < 3
-            iq = np.exp(1j * 2 * np.pi * 200e3 * t) * pulse_mask * 3.5 + noise
-        else:
-            sig_type = "Hostile Jammer"
-            iq = (np.random.randn(num_samples) + 1j * np.random.randn(num_samples)) * 2.8
-
-        channels[ch] = {
-            "iq": iq,
-            "type": sig_type,
-            "freq_mhz": 100 + ch * 15,
-            "sample_rate": sample_rate
-        }
-    return channels
-
-
-def fallback_analyze_channels(channels, threshold_db=-10.0):
-    """Calculates power spectral density, prioritizes channels, and classifies signals."""
-    records = []
-    for ch, data in channels.items():
-        iq = data["iq"]
-        power = np.mean(np.abs(iq) ** 2)
-        power_db = 10 * np.log10(power + 1e-12)
-        
-        sig_type = data["type"]
-        if power_db < threshold_db:
-            threat_level = "LOW"
-            status = "CLEAR"
-        elif sig_type == "Hostile Jammer":
-            threat_level = "CRITICAL"
-            status = "BROADBAND JAMMING"
-        elif sig_type == "Hostile Radar":
-            threat_level = "HIGH"
-            status = "PULSED RADAR LOCK"
-        elif sig_type == "Civilian Broadcast":
-            threat_level = "LOW"
-            status = "STANDARD COMM"
-        else:
-            threat_level = "MEDIUM"
-            status = "ANOMALOUS ACTIVITY"
-
-        priority_score = max(0.0, float(power_db - threshold_db))
-
-        records.append({
-            "Channel": ch,
-            "Center Freq (MHz)": data["freq_mhz"],
-            "Power (dB)": round(power_db, 2),
-            "Classification": sig_type,
-            "Threat Level": threat_level,
-            "Status": status,
-            "Priority Score": round(priority_score, 2),
-            "Timestamp": time.strftime("%H:%M:%S")
-        })
-        
-    df = pd.DataFrame(records)
-    df = df.sort_values(by="Priority Score", ascending=False).reset_index(drop=True)
-    return df
-
-
-# ==========================================
-# SESSION STATE INITIALIZATION
-# ==========================================
-if "threat_log" not in st.session_state:
-    st.session_state.threat_log = pd.DataFrame()
-if "current_channels" not in st.session_state:
-    st.session_state.current_channels = fallback_generate_spectrum()
-if "current_analysis" not in st.session_state:
-    st.session_state.current_analysis = fallback_analyze_channels(st.session_state.current_channels)
-
-
-# ==========================================
-# SIDEBAR CONTROLS
-# ==========================================
-st.sidebar.title("🛡️ Control Panel")
-st.sidebar.markdown("---")
-
-st.sidebar.subheader("Scan Settings")
-threshold_db = st.sidebar.slider("Noise Floor Threshold (dB)", -25.0, 10.0, -10.0, 1.0)
-auto_refresh = st.sidebar.checkbox("Enable Auto Scanning", value=False)
-scan_interval = st.sidebar.slider("Scan Speed (seconds)", 1, 5, 2)
-
-st.sidebar.markdown("---")
-st.sidebar.subheader("Actions")
-
-if st.sidebar.button("⚡ Execute Immediate Sweep", use_container_width=True):
-    if HAS_CUSTOM_MODULES:
-        st.session_state.current_channels = generate_spectrum_batch()
-        st.session_state.current_analysis = scan_and_prioritize(st.session_state.current_channels, threshold_db)
-    else:
-        st.session_state.current_channels = fallback_generate_spectrum()
-        st.session_state.current_analysis = fallback_analyze_channels(
-            st.session_state.current_channels, threshold_db
+def _ensure_state(threshold_db: float) -> None:
+    if "threat_log" not in st.session_state:
+        st.session_state.threat_log = pd.DataFrame()
+    if "current_channels" not in st.session_state:
+        channels, analysis = _new_scan(threshold_db)
+        st.session_state.current_channels = channels
+        st.session_state.current_analysis = analysis
+        st.session_state.analysis_threshold = threshold_db
+        st.session_state.scan_number = 1
+    elif st.session_state.get("analysis_threshold") != threshold_db:
+        st.session_state.current_analysis = scan_and_prioritize(
+            st.session_state.current_channels,
+            threshold_db=threshold_db,
         )
-
-if st.sidebar.button("🗑️ Clear Threat History", use_container_width=True):
-    st.session_state.threat_log = pd.DataFrame()
-    st.rerun()
-
-st.sidebar.markdown("---")
-if HAS_CUSTOM_MODULES:
-    st.sidebar.success("Backend Engine: Custom Modules Connected")
-else:
-    st.sidebar.info("Backend Engine: Standalone Generator Active")
+        st.session_state.analysis_threshold = threshold_db
 
 
-# ==========================================
-# MAIN DASHBOARD HEADER
-# ==========================================
-st.title("📡 Defensive Spectrum-Awareness System")
-st.caption("Real-Time RF Monitoring, Energy Prioritization & Threat Identification Engine")
-
-analysis_df = st.session_state.current_analysis
-
-# Update persistent threat history log
-threats_detected = analysis_df[analysis_df["Threat Level"].isin(["HIGH", "CRITICAL"])]
-if not threats_detected.empty:
-    st.session_state.threat_log = pd.concat(
-        [threats_detected, st.session_state.threat_log]
-    ).drop_duplicates().head(50)
-
-# Key Performance Indicators (KPIs)
-col1, col2, col3, col4 = st.columns(4)
-total_channels = len(analysis_df)
-active_channels = len(analysis_df[analysis_df["Priority Score"] > 0])
-critical_threats = len(analysis_df[analysis_df["Threat Level"] == "CRITICAL"])
-high_threats = len(analysis_df[analysis_df["Threat Level"] == "HIGH"])
-
-col1.metric("Monitored Channels", total_channels)
-col2.metric("Signals Above Threshold", active_channels)
-col3.metric("Critical Threat (Jammers)", critical_threats, delta_color="inverse")
-col4.metric("High Threat (Radars)", high_threats, delta_color="inverse")
-
-st.markdown("---")
-
-# ==========================================
-# TABS INTERFACE
-# ==========================================
-tab_spectrum, tab_threats, tab_inspector = st.tabs([
-    "📊 Live Spectrum Monitor", 
-    "🚨 Prioritized Threat Feed", 
-    "🔍 Signal Inspector & STFT"
-])
+def _execute_sweep(threshold_db: float) -> None:
+    channels, analysis = _new_scan(threshold_db)
+    st.session_state.current_channels = channels
+    st.session_state.current_analysis = analysis
+    st.session_state.analysis_threshold = threshold_db
+    st.session_state.scan_number = int(st.session_state.get("scan_number", 0)) + 1
 
 
-# ------------------------------------------
-# TAB 1: LIVE SPECTRUM MONITOR
-# ------------------------------------------
-with tab_spectrum:
-    st.subheader("Multi-Channel Power Spectral Density")
-    
-    # Spectrum Power Chart
-    fig_spectrum = px.bar(
-        analysis_df.sort_values(by="Channel"),
+def _append_threats(analysis: pd.DataFrame) -> None:
+    if st.session_state.get("log_clear_scan") == st.session_state.get("scan_number"):
+        return
+    threats = analysis[analysis["Threat Level"].isin(["HIGH", "CRITICAL"])].copy()
+    if threats.empty:
+        return
+    scan_number = st.session_state.get("scan_number", 1)
+    now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    threats.insert(
+        0,
+        "Incident ID",
+        [f"S{scan_number:04d}-CH{channel}" for channel in threats["Channel"]],
+    )
+    threats.insert(1, "Detected At", now)
+    existing = st.session_state.threat_log
+    st.session_state.threat_log = (
+        pd.concat([threats, existing], ignore_index=True)
+        .drop_duplicates(subset=["Incident ID"], keep="first")
+        .head(50)
+    )
+
+
+def _render_spectrum(analysis: pd.DataFrame, threshold_db: float) -> None:
+    st.subheader("Multi-Channel Power Spectrum")
+    ordered = analysis.sort_values("Channel")
+    spectrum_figure = px.bar(
+        ordered,
         x="Center Freq (MHz)",
         y="Power (dB)",
         color="Threat Level",
         color_discrete_map={
-            "CRITICAL": "#FF2B2B",
-            "HIGH": "#FF8C00",
-            "MEDIUM": "#FFD700",
-            "LOW": "#00CC96"
+            "CRITICAL": "#ff3b30",
+            "HIGH": "#ff9500",
+            "MEDIUM": "#ffd60a",
+            "LOW": "#30d158",
         },
-        hover_data=["Channel", "Classification", "Status", "Priority Score"],
-        title="Current Spectrum Scan across Bands"
+        hover_data=["Channel", "Classification", "Confidence (%)", "Priority Score"],
+        title="Current power by monitored frequency channel",
     )
-    
-    fig_spectrum.add_hline(
-        y=threshold_db, 
-        line_dash="dash", 
-        line_color="red", 
-        annotation_text=f"Threshold ({threshold_db} dB)"
+    spectrum_figure.add_hline(
+        y=threshold_db,
+        line_dash="dash",
+        line_color="#ff453a",
+        annotation_text=f"Noise floor ({threshold_db:.0f} dB)",
     )
-    fig_spectrum.update_layout(template="plotly_dark", height=400)
-    st.plotly_chart(fig_spectrum, use_container_width=True)
+    spectrum_figure.update_layout(template="plotly_dark", height=410, margin=dict(t=55))
+    st.plotly_chart(spectrum_figure, use_container_width=True)
 
-    # Historical Waterfall Simulation
-    st.subheader("Spectrum Heatmap (Channel Power over Channels)")
-    power_matrix = np.tile(analysis_df.sort_values(by="Channel")["Power (dB)"].values, (10, 1))
-    
-    fig_waterfall = px.imshow(
-        power_matrix,
-        labels=dict(x="Channel Index", y="Sweep Time Window", color="Power (dB)"),
-        x=analysis_df.sort_values(by="Channel")["Channel"].values,
-        color_continuous_scale="Viridis"
+    st.subheader("Spectrum Waterfall")
+    # Keep a short visual history in session state without storing IQ arrays
+    # inside the incident log.
+    current_power = ordered["Power (dB)"].to_numpy(dtype=float)
+    waterfall_history = st.session_state.get("waterfall_history", [])
+    waterfall_history = (waterfall_history + [current_power])[-12:]
+    st.session_state.waterfall_history = waterfall_history
+    waterfall = np.vstack(waterfall_history)
+    waterfall_figure = px.imshow(
+        waterfall,
+        x=ordered["Channel"].tolist(),
+        labels={"x": "Channel", "y": "Sweep", "color": "Power (dB)"},
+        color_continuous_scale="Viridis",
+        aspect="auto",
     )
-    fig_waterfall.update_layout(template="plotly_dark", height=250)
-    st.plotly_chart(fig_waterfall, use_container_width=True)
+    waterfall_figure.update_layout(template="plotly_dark", height=280)
+    st.plotly_chart(waterfall_figure, use_container_width=True)
 
 
-# ------------------------------------------
-# TAB 2: PRIORITIZED THREAT FEED
-# ------------------------------------------
-with tab_threats:
+def _render_threat_feed(analysis: pd.DataFrame) -> None:
     st.subheader("Prioritized Real-Time Scan Observations")
-    st.caption("Channels are ranked dynamically by priority score (energy above noise baseline).")
-    
-    # Custom DataFrame Styling
-    def highlight_threats(val):
-        if val == "CRITICAL":
-            return "background-color: #721c24; color: white; font-weight: bold;"
-        elif val == "HIGH":
-            return "background-color: #856404; color: white; font-weight: bold;"
-        elif val == "MEDIUM":
-            return "background-color: #383d41; color: white;"
-        return "background-color: #155724; color: white;"
+    st.caption("Priority combines energy above the noise floor with model-assigned threat severity.")
 
-    styled_df = analysis_df.style.map(highlight_threats, subset=["Threat Level"])
-    st.dataframe(styled_df, use_container_width=True, height=300)
+    def row_style(row: pd.Series) -> list[str]:
+        colors = {
+            "CRITICAL": "background-color: #5c1010; color: white; font-weight: bold",
+            "HIGH": "background-color: #6b3d00; color: white; font-weight: bold",
+            "MEDIUM": "background-color: #544b00; color: white",
+            "LOW": "",
+        }
+        return [colors.get(row["Threat Level"], "")] * len(row)
 
-    st.subheader("Threat Incident Log (History)")
-    if not st.session_state.threat_log.empty:
-        st.dataframe(st.session_state.threat_log, use_container_width=True)
+    st.dataframe(
+        analysis.style.apply(row_style, axis=1),
+        use_container_width=True,
+        height=360,
+    )
+    st.subheader("Threat Incident Log")
+    if st.session_state.threat_log.empty:
+        st.info("No HIGH or CRITICAL incidents have been logged yet.")
     else:
-        st.info("No critical or high-priority threats logged in history.")
+        st.dataframe(st.session_state.threat_log, use_container_width=True, height=300)
 
 
-# ------------------------------------------
-# TAB 3: SIGNAL INSPECTOR & STFT SPECTROGRAM
-# ------------------------------------------
-with tab_inspector:
-    st.subheader("Deep Signal Inspection")
-    selected_ch = st.selectbox("Select Channel to Inspect:", list(st.session_state.current_channels.keys()))
-    
-    ch_data = st.session_state.current_channels[selected_ch]
-    iq_samples = ch_data["iq"]
-    fs = ch_data["sample_rate"]
-    
-    col_a, col_b = st.columns(2)
-    
-    with col_a:
-        st.markdown(f"**Channel {selected_ch} IQ Waveform (In-Phase / Quadrature)**")
-        time_axis = np.arange(len(iq_samples)) / fs * 1e6  # Microseconds
-        
-        fig_iq = go.Figure()
-        fig_iq.add_trace(go.Scatter(x=time_axis, y=np.real(iq_samples), name="In-Phase (I)", line=dict(color="#00BFFF")))
-        fig_iq.add_trace(go.Scatter(x=time_axis, y=np.imag(iq_samples), name="Quadrature (Q)", line=dict(color="#FF6347")))
-        fig_iq.update_layout(
-            template="plotly_dark", 
-            xaxis_title="Time (µs)", 
-            yaxis_title="Amplitude", 
-            height=350,
-            margin=dict(l=20, r=20, t=30, b=20)
+def _render_inspector(channels: dict[int, dict[str, Any]]) -> None:
+    st.subheader("Signal Inspector & STFT Spectrogram")
+    selected_channel = st.selectbox(
+        "Select channel",
+        options=list(channels),
+        format_func=lambda channel: (
+            f"Channel {channel} — {channels[channel].get('freq_mhz', 0):.1f} MHz"
+        ),
+    )
+    channel = channels[selected_channel]
+    iq = np.asarray(channel["iq"], dtype=np.complex128)
+    sample_rate = float(channel.get("sample_rate", 1.0e6))
+    time_axis_us = np.arange(iq.size) / sample_rate * 1.0e6
+
+    left, right = st.columns(2)
+    with left:
+        st.markdown("**In-Phase / Quadrature waveform**")
+        waveform = go.Figure()
+        waveform.add_trace(
+            go.Scatter(x=time_axis_us, y=iq.real, name="I", line=dict(color="#00bfff"))
         )
-        st.plotly_chart(fig_iq, use_container_width=True)
-
-    with col_b:
-        st.markdown(f"**Channel {selected_ch} Spectrogram (STFT)**")
-        f, t_spec, Sxx = signal.spectrogram(iq_samples, fs=fs, nperseg=64)
-        Sxx_db = 10 * np.log10(np.abs(Sxx) + 1e-12)
-        
-        fig_spec = px.imshow(
-            Sxx_db,
-            x=t_spec * 1e6,
-            y=f / 1e3,
-            labels=dict(x="Time (µs)", y="Frequency (kHz)", color="Power (dB)"),
-            color_continuous_scale="Jet",
-            origin="lower"
+        waveform.add_trace(
+            go.Scatter(x=time_axis_us, y=iq.imag, name="Q", line=dict(color="#ff6347"))
         )
-        fig_spec.update_layout(
-            template="plotly_dark", 
-            height=350,
-            margin=dict(l=20, r=20, t=30, b=20)
+        waveform.update_layout(
+            template="plotly_dark",
+            xaxis_title="Time (µs)",
+            yaxis_title="Amplitude",
+            height=370,
+            margin=dict(l=20, r=20, t=30, b=20),
         )
-        st.plotly_chart(fig_spec, use_container_width=True)
+        st.plotly_chart(waveform, use_container_width=True)
 
-# ==========================================
-# AUTO REFRESH LOOP
-# ==========================================
-if auto_refresh:
-    time.sleep(scan_interval)
-    if HAS_CUSTOM_MODULES:
-        st.session_state.current_channels = generate_spectrum_batch()
-        st.session_state.current_analysis = scan_and_prioritize(st.session_state.current_channels, threshold_db)
+    with right:
+        st.markdown("**Short-Time Fourier Transform spectrogram**")
+        frequencies, times, spectrogram = signal.spectrogram(
+            iq,
+            fs=sample_rate,
+            nperseg=min(64, iq.size),
+            noverlap=min(32, max(0, iq.size // 4)),
+            return_onesided=False,
+            scaling="density",
+        )
+        frequencies = np.fft.fftshift(frequencies)
+        spectrogram = np.fft.fftshift(np.real(spectrogram), axes=0)
+        spectrogram_db = 10.0 * np.log10(np.maximum(spectrogram, np.finfo(float).tiny))
+        spectrogram_figure = px.imshow(
+            spectrogram_db,
+            x=times * 1.0e6,
+            y=frequencies / 1.0e3,
+            labels={"x": "Time (µs)", "y": "Frequency (kHz)", "color": "Power (dB)"},
+            color_continuous_scale="Turbo",
+            origin="lower",
+            aspect="auto",
+        )
+        spectrogram_figure.update_layout(
+            template="plotly_dark",
+            height=370,
+            margin=dict(l=20, r=20, t=30, b=20),
+        )
+        st.plotly_chart(spectrogram_figure, use_container_width=True)
+
+
+def _render_main_dashboard(threshold_db: float) -> None:
+    analysis = st.session_state.current_analysis
+    channels = st.session_state.current_channels
+    _append_threats(analysis)
+
+    st.title("🛡️ Defensive Spectrum-Awareness System")
+    st.caption("Synthetic RF monitoring, energy prioritization, and threat identification")
+    kpi_1, kpi_2, kpi_3, kpi_4 = st.columns(4)
+    kpi_1.metric("Monitored Channels", len(analysis))
+    kpi_2.metric("Signals Above Threshold", int((analysis["Priority Score"] > 0).sum()))
+    kpi_3.metric(
+        "Critical Threats",
+        int((analysis["Threat Level"] == "CRITICAL").sum()),
+        delta_color="inverse",
+    )
+    kpi_4.metric(
+        "High Threats",
+        int((analysis["Threat Level"] == "HIGH").sum()),
+        delta_color="inverse",
+    )
+    st.divider()
+
+    spectrum_tab, threat_tab, inspector_tab = st.tabs(
+        ["📊 Live Spectrum Monitor", "🚨 Prioritized Threat Feed", "🔍 Signal Inspector"]
+    )
+    with spectrum_tab:
+        _render_spectrum(analysis, threshold_db)
+    with threat_tab:
+        _render_threat_feed(analysis)
+    with inspector_tab:
+        _render_inspector(channels)
+
+
+def main() -> None:
+    threshold_db = st.sidebar.slider(
+        "Noise Floor Threshold (dB)",
+        min_value=-25.0,
+        max_value=10.0,
+        value=-10.0,
+        step=1.0,
+    )
+    auto_refresh = st.sidebar.toggle("Enable Auto-Refresh", value=False)
+    scan_interval = st.sidebar.slider("Auto-refresh interval (seconds)", 1, 10, 3)
+    sweep_requested = st.sidebar.button("⚡ Manual Sweep", use_container_width=True)
+    clear_requested = st.sidebar.button("🗑️ Clear Threat Log", use_container_width=True)
+
+    _ensure_state(threshold_db)
+    if sweep_requested:
+        _execute_sweep(threshold_db)
+    if clear_requested:
+        st.session_state.threat_log = pd.DataFrame()
+        st.session_state.log_clear_scan = st.session_state.get("scan_number", 1)
+
+    st.sidebar.divider()
+    if HAS_CLASSIFIER:
+        st.sidebar.success("Classifier: Random Forest online")
     else:
-        st.session_state.current_channels = fallback_generate_spectrum()
-        st.session_state.current_analysis = fallback_analyze_channels(
-            st.session_state.current_channels, threshold_db
-        )
-    st.rerun()
+        st.sidebar.warning("Classifier unavailable; heuristic fallback active")
+    st.sidebar.caption(f"Sweep #{st.session_state.get('scan_number', 1)}")
+
+    if auto_refresh and hasattr(st, "fragment"):
+        @st.fragment(run_every=scan_interval)
+        def refreshed_dashboard() -> None:
+            _execute_sweep(threshold_db)
+            _render_main_dashboard(threshold_db)
+
+        refreshed_dashboard()
+    else:
+        _render_main_dashboard(threshold_db)
+        if auto_refresh:
+            st.info("Auto-refresh requires a recent Streamlit version with fragment support.")
+
+
+if __name__ == "__main__":
+    main()

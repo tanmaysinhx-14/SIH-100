@@ -1,252 +1,272 @@
-"""
-classifier.py - Signal Feature Extraction and Machine Learning Threat Classifier
-Extracts statistical and spectral metrics from IQ signals and classifies them
-using a trained Random Forest model.
-"""
+"""Fast feature extraction and Random Forest classification for DSAS signals."""
 
-import os
+from __future__ import annotations
+
+import pickle
+from pathlib import Path
+from typing import Any
+
 import numpy as np
-import scipy.stats as stats
-import scipy.signal as signal
+from scipy import signal, stats
 from sklearn.ensemble import RandomForestClassifier
 from sklearn.preprocessing import StandardScaler
-import joblib
 
-# Fallback simulator import if available
-try:
-    from simulator import (
-        generate_awgn,
-        generate_civilian_signal,
-        generate_hostile_radar,
-        generate_hostile_jammer
-    )
-    HAS_SIMULATOR = True
-except ImportError:
-    HAS_SIMULATOR = False
-
-MODEL_FILE = "rf_signal_model.joblib"
+from simulator import (
+    generate_awgn,
+    generate_civilian_signal,
+    generate_hostile_jammer,
+    generate_hostile_radar,
+)
 
 
-# ==========================================
-# 1. FEATURE EXTRACTION ENGINE
-# ==========================================
-def extract_signal_features(iq_samples: np.ndarray, sample_rate: float = 1e6) -> np.ndarray:
-    """
-    Extracts a 9-dimensional statistical and spectral feature vector from complex IQ samples.
-    
-    Features:
-    1. Mean Power (dB)
-    2. Peak-to-Average Power Ratio (PAPR in dB)
-    3. Amplitude Standard Deviation
-    4. Amplitude Kurtosis (peakedness / pulse indicator)
-    5. Phase Standard Deviation
-    6. Instantaneous Frequency Standard Deviation
-    7. Spectral Flatness (distinguishes broadband noise/jamming from narrow carriers)
-    8. Spectral Centroid
-    9. Spectral Spread (Bandwidth indicator)
-    """
-    amp = np.abs(iq_samples)
-    power = amp ** 2
-    mean_power = np.mean(power) + 1e-12
-    peak_power = np.max(power) + 1e-12
-    
-    # 1. Power & PAPR
-    mean_power_db = 10 * np.log10(mean_power)
-    papr_db = 10 * np.log10(peak_power / mean_power)
-    
-    # 2. Amplitude statistics
-    amp_std = np.std(amp)
-    amp_kurtosis = stats.kurtosis(amp)
-    
-    # 3. Phase & Frequency statistics
-    phase = np.angle(iq_samples)
-    phase_std = np.std(phase)
-    
-    # Instantaneous frequency (derivative of unwrapped phase)
+MODEL_FILE = "rf_signal_model.pkl"
+FEATURE_NAMES = (
+    "Mean Power (dB)",
+    "PAPR (dB)",
+    "Amplitude Std",
+    "Amplitude Kurtosis",
+    "Phase Std",
+    "Instantaneous Frequency Std",
+    "Spectral Flatness",
+    "Spectral Centroid",
+    "Spectral Spread",
+)
+CLASS_LABELS = (
+    "Background Noise",
+    "Civilian Broadcast",
+    "Hostile Radar",
+    "Hostile Jammer",
+)
+
+
+def _validated_iq(iq_samples: np.ndarray) -> np.ndarray:
+    iq = np.asarray(iq_samples, dtype=np.complex128).reshape(-1)
+    if iq.size < 2:
+        raise ValueError("iq_samples must contain at least two samples")
+    if not np.all(np.isfinite(iq)):
+        raise ValueError("iq_samples must contain only finite values")
+    return iq
+
+
+def _finite(value: float, default: float = 0.0) -> float:
+    value = float(value)
+    return value if np.isfinite(value) else default
+
+
+def extract_signal_features(
+    iq_samples: np.ndarray,
+    sample_rate: float = 1.0e6,
+) -> np.ndarray:
+    """Return the required nine-dimensional feature vector for one IQ signal."""
+
+    iq = _validated_iq(iq_samples)
+    if not np.isfinite(sample_rate) or sample_rate <= 0:
+        raise ValueError("sample_rate must be a positive finite number")
+
+    amplitude = np.abs(iq)
+    power = amplitude**2
+    mean_power = max(float(np.mean(power)), np.finfo(float).tiny)
+    peak_power = max(float(np.max(power)), np.finfo(float).tiny)
+
+    mean_power_db = 10.0 * np.log10(mean_power)
+    papr_db = 10.0 * np.log10(peak_power / mean_power)
+    amplitude_std = float(np.std(amplitude))
+    amplitude_kurtosis = _finite(stats.kurtosis(amplitude, fisher=False, bias=False))
+
+    phase = np.angle(iq)
+    phase_std = float(np.std(phase))
     unwrapped_phase = np.unwrap(phase)
-    inst_freq = np.diff(unwrapped_phase) * sample_rate / (2 * np.pi)
-    freq_std = np.std(inst_freq)
-    
-    # 4. Spectral statistics (via Periodogram)
-    freqs, psd = signal.periodogram(iq_samples, fs=sample_rate, return_onesided=False)
-    psd = psd + 1e-12  # Avoid division by zero
-    
-    # Spectral Flatness = Geometric Mean / Arithmetic Mean
-    geometric_mean = np.exp(np.mean(np.log(psd)))
-    arithmetic_mean = np.mean(psd)
-    spectral_flatness = geometric_mean / arithmetic_mean
-    
-    # Spectral Centroid & Spread
-    psd_norm = psd / np.sum(psd)
-    spectral_centroid = np.sum(freqs * psd_norm)
-    spectral_spread = np.sqrt(np.sum(((freqs - spectral_centroid) ** 2) * psd_norm))
-    
-    return np.array([
-        mean_power_db,
-        papr_db,
-        amp_std,
-        amp_kurtosis,
-        phase_std,
-        freq_std,
-        spectral_flatness,
-        spectral_centroid,
-        spectral_spread
-    ])
+    instantaneous_frequency = np.diff(unwrapped_phase) * float(sample_rate) / (2.0 * np.pi)
+    instantaneous_frequency_std = float(np.std(instantaneous_frequency))
+
+    # A two-sided periodogram is appropriate for complex baseband IQ data.
+    frequencies, psd = signal.periodogram(
+        iq,
+        fs=float(sample_rate),
+        window="hann",
+        detrend=False,
+        return_onesided=False,
+        scaling="density",
+    )
+    frequencies = np.fft.fftshift(frequencies)
+    psd = np.fft.fftshift(np.maximum(np.real(psd), 0.0))
+    psd_floor = np.finfo(float).tiny
+    psd_safe = np.maximum(psd, psd_floor)
+    geometric_mean = np.exp(np.mean(np.log(psd_safe)))
+    arithmetic_mean = max(float(np.mean(psd_safe)), psd_floor)
+    spectral_flatness = _finite(geometric_mean / arithmetic_mean)
+    psd_sum = float(np.sum(psd_safe))
+    psd_weights = psd_safe / psd_sum
+    spectral_centroid = _finite(np.sum(frequencies * psd_weights))
+    spectral_spread = _finite(
+        np.sqrt(np.sum(((frequencies - spectral_centroid) ** 2) * psd_weights))
+    )
+
+    return np.asarray(
+        [
+            mean_power_db,
+            papr_db,
+            amplitude_std,
+            amplitude_kurtosis,
+            phase_std,
+            instantaneous_frequency_std,
+            spectral_flatness,
+            spectral_centroid,
+            spectral_spread,
+        ],
+        dtype=float,
+    )
 
 
-# ==========================================
-# 2. SYNTHETIC TRAINING DATA GENERATOR
-# ==========================================
-def _generate_synthetic_training_data(samples_per_class: int = 300, num_iq_samples: int = 1024):
-    """Generates labeled feature vectors for model training."""
-    X = []
-    y = []
-    
-    classes = ["Background Noise", "Civilian Broadcast", "Hostile Radar", "Hostile Jammer"]
-    
-    for _ in range(samples_per_class):
-        # 1. Background Noise
-        if HAS_SIMULATOR:
-            iq_noise = generate_awgn(num_iq_samples, noise_power_db=np.random.uniform(-25, -15))
-        else:
-            p = np.random.uniform(-25, -15)
-            iq_noise = (np.random.randn(num_iq_samples) + 1j * np.random.randn(num_iq_samples)) * np.sqrt(10**(p/10)/2)
-        X.append(extract_signal_features(iq_noise))
-        y.append("Background Noise")
-        
-        # 2. Civilian Broadcast
-        if HAS_SIMULATOR:
-            iq_civ, _ = generate_civilian_signal(
-                num_iq_samples, 
-                carrier_freq_hz=np.random.uniform(20e3, 100e3),
-                snr_db=np.random.uniform(10, 25)
-            )
-        else:
-            t = np.arange(num_iq_samples) / 1e6
-            iq_civ = np.exp(1j * 2 * np.pi * 50e3 * t) * 0.8 + generate_awgn(num_iq_samples, -20) if HAS_SIMULATOR else np.exp(1j * 2 * np.pi * 50e3 * t)
-        X.append(extract_signal_features(iq_civ))
-        y.append("Civilian Broadcast")
-        
-        # 3. Hostile Radar
-        if HAS_SIMULATOR:
-            iq_radar, _ = generate_hostile_radar(
-                num_iq_samples,
-                carrier_freq_hz=np.random.uniform(150e3, 300e3),
-                pulse_width_sec=np.random.uniform(10e-6, 30e-6)
-            )
-        else:
-            t = np.arange(num_iq_samples) / 1e6
-            mask = (t * 1e4).astype(int) % 10 < 3
-            iq_radar = np.exp(1j * 2 * np.pi * 200e3 * t) * mask * 3.5
-        X.append(extract_signal_features(iq_radar))
-        y.append("Hostile Radar")
-        
-        # 4. Hostile Jammer
-        if HAS_SIMULATOR:
-            iq_jammer, _ = generate_hostile_jammer(num_iq_samples, jammer_power_db=np.random.uniform(5, 15))
-        else:
-            iq_jammer = (np.random.randn(num_iq_samples) + 1j * np.random.randn(num_iq_samples)) * 2.5
-        X.append(extract_signal_features(iq_jammer))
-        y.append("Hostile Jammer")
-        
-    return np.array(X), np.array(y)
+def _generate_synthetic_training_data(
+    samples_per_class: int = 300,
+    num_iq_samples: int = 1024,
+    random_state: int = 2024,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Generate labeled features entirely in memory for model training."""
+
+    if int(samples_per_class) != samples_per_class or samples_per_class < 1:
+        raise ValueError("samples_per_class must be a positive integer")
+    if int(num_iq_samples) != num_iq_samples or num_iq_samples < 2:
+        raise ValueError("num_iq_samples must be at least two")
+
+    random = np.random.default_rng(random_state)
+    features: list[np.ndarray] = []
+    labels: list[str] = []
+    for _ in range(int(samples_per_class)):
+        noise = generate_awgn(
+            num_iq_samples,
+            noise_power_db=float(random.uniform(-25.0, -15.0)),
+            rng=random,
+        )
+        features.append(extract_signal_features(noise))
+        labels.append("Background Noise")
+
+        civilian = generate_civilian_signal(
+            num_iq_samples,
+            carrier_freq_hz=float(random.uniform(20.0e3, 100.0e3)),
+            snr_db=float(random.uniform(10.0, 25.0)),
+            rng=random,
+        )
+        features.append(extract_signal_features(civilian))
+        labels.append("Civilian Broadcast")
+
+        radar = generate_hostile_radar(
+            num_iq_samples,
+            carrier_freq_hz=float(random.uniform(150.0e3, 300.0e3)),
+            pulse_width_sec=float(random.uniform(10.0e-6, 30.0e-6)),
+            rng=random,
+        )
+        features.append(extract_signal_features(radar))
+        labels.append("Hostile Radar")
+
+        jammer = generate_hostile_jammer(
+            num_iq_samples,
+            jammer_power_db=float(random.uniform(5.0, 15.0)),
+            rng=random,
+        )
+        features.append(extract_signal_features(jammer))
+        labels.append("Hostile Jammer")
+
+    return np.vstack(features), np.asarray(labels, dtype=object)
 
 
-# ==========================================
-# 3. CLASSIFIER MODEL PIPELINE
-# ==========================================
 class RFSignalClassifier:
-    """Random Forest Classifier wrapper with auto-training capabilities."""
-    
-    def __init__(self):
-        self.scaler = StandardScaler()
-        self.model = RandomForestClassifier(n_estimators=100, max_depth=10, random_state=42)
-        self.is_trained = False
-        
-    def train(self, samples_per_class: int = 300):
-        """Trains the Random Forest model on generated synthetic dataset."""
-        X, y = _generate_synthetic_training_data(samples_per_class=samples_per_class)
-        X_scaled = self.scaler.fit_transform(X)
-        self.model.fit(X_scaled, y)
-        self.is_trained = True
-        
-    def save(self, filepath: str = MODEL_FILE):
-        """Saves trained model and scaler to disk."""
-        joblib.dump({"model": self.model, "scaler": self.scaler}, filepath)
-        
-    def load(self, filepath: str = MODEL_FILE) -> bool:
-        """Loads trained model and scaler from disk if exists."""
-        if os.path.exists(filepath):
-            data = joblib.load(filepath)
-            self.model = data["model"]
-            self.scaler = data["scaler"]
-            self.is_trained = True
-            return True
-        return False
+    """Standard-scaled, shallow Random Forest classifier for the four classes."""
 
-    def predict(self, iq_samples: np.ndarray, sample_rate: float = 1e6) -> dict:
-        """
-        Classifies an IQ signal array.
-        Returns prediction, probability/confidence score, threat level, and operational status.
-        """
+    def __init__(self, random_state: int = 42) -> None:
+        self.scaler = StandardScaler()
+        self.model = RandomForestClassifier(
+            n_estimators=100,
+            max_depth=10,
+            random_state=random_state,
+            n_jobs=-1,
+        )
+        self.is_trained = False
+
+    def train(self, samples_per_class: int = 300) -> "RFSignalClassifier":
+        """Generate synthetic features and train the model, returning ``self``."""
+
+        x_train, labels = _generate_synthetic_training_data(samples_per_class)
+        self.scaler.fit(x_train)
+        self.model.fit(self.scaler.transform(x_train), labels)
+        self.is_trained = True
+        return self
+
+    def save(self, filepath: str | Path = MODEL_FILE) -> Path:
+        """Persist the trained model and scaler using Python's standard library."""
+
         if not self.is_trained:
-            if not self.load():
-                self.train()
-                self.save()
-                
-        features = extract_signal_features(iq_samples, sample_rate).reshape(1, -1)
-        features_scaled = self.scaler.transform(features)
-        
-        pred_class = self.model.predict(features_scaled)[0]
-        probs = self.model.predict_proba(features_scaled)[0]
-        confidence = float(np.max(probs))
-        
-        # Map threat severity & operational status
-        if pred_class == "Hostile Jammer":
-            threat_level = "CRITICAL"
-            status = "BROADBAND JAMMING"
-        elif pred_class == "Hostile Radar":
-            threat_level = "HIGH"
-            status = "PULSED RADAR LOCK"
-        elif pred_class == "Civilian Broadcast":
-            threat_level = "LOW"
-            status = "STANDARD COMM"
-        else:
-            threat_level = "LOW"
-            status = "CLEAR"
-            
+            raise RuntimeError("train the classifier before saving it")
+        destination = Path(filepath)
+        with destination.open("wb") as handle:
+            pickle.dump({"model": self.model, "scaler": self.scaler}, handle)
+        return destination
+
+    def load(self, filepath: str | Path = MODEL_FILE) -> bool:
+        """Load a previously saved model; return ``False`` when it is absent."""
+
+        source = Path(filepath)
+        if not source.exists():
+            return False
+        with source.open("rb") as handle:
+            payload: dict[str, Any] = pickle.load(handle)
+        self.model = payload["model"]
+        self.scaler = payload["scaler"]
+        self.is_trained = True
+        return True
+
+    def predict(
+        self,
+        iq_samples: np.ndarray,
+        sample_rate: float = 1.0e6,
+    ) -> dict[str, Any]:
+        """Classify one IQ signal and return label, confidence, and severity."""
+
+        if not self.is_trained:
+            # Keep first-use dashboard latency low while the public train()
+            # method still follows the requested 300-samples-per-class default.
+            self.train(samples_per_class=100)
+
+        feature_vector = extract_signal_features(iq_samples, sample_rate)
+        scaled_features = self.scaler.transform(feature_vector.reshape(1, -1))
+        prediction = str(self.model.predict(scaled_features)[0])
+        probabilities = self.model.predict_proba(scaled_features)[0]
+        confidence = float(np.max(probabilities))
+
+        severity = {
+            "Hostile Jammer": ("CRITICAL", "BROADBAND JAMMING"),
+            "Hostile Radar": ("HIGH", "PULSED RADAR LOCK"),
+            "Civilian Broadcast": ("LOW", "STANDARD COMM"),
+            "Background Noise": ("LOW", "CLEAR"),
+        }
+        threat_level, status = severity.get(prediction, ("MEDIUM", "ANOMALOUS ACTIVITY"))
         return {
-            "classification": pred_class,
-            "confidence": round(confidence * 100, 2),
+            "classification": prediction,
+            "confidence": round(confidence * 100.0, 2),
             "threat_level": threat_level,
             "status": status,
-            "power_db": round(features[0][0], 2),
-            "papr_db": round(features[0][1], 2)
+            "power_db": round(float(feature_vector[0]), 2),
+            "papr_db": round(float(feature_vector[1]), 2),
+            "features": feature_vector,
         }
 
 
-# Singleton model instance
 _CLASSIFIER_INSTANCE = RFSignalClassifier()
 
 
-def classify_channel(iq_samples: np.ndarray, sample_rate: float = 1e6) -> dict:
-    """Convenience function for app.py / scanner.py integration."""
+def classify_channel(iq_samples: np.ndarray, sample_rate: float = 1.0e6) -> dict[str, Any]:
+    """Classify a channel with the process-local shared model instance."""
+
     return _CLASSIFIER_INSTANCE.predict(iq_samples, sample_rate)
 
 
 if __name__ == "__main__":
-    print("Initializing and training Random Forest Signal Classifier...")
-    clf = RFSignalClassifier()
-    clf.train(samples_per_class=400)
-    clf.save()
-    print("Model trained and saved successfully.")
-    
-    # Test on a dummy pulse wave
-    t = np.arange(1024) / 1e6
-    mask = (t * 1e4).astype(int) % 10 < 3
-    test_iq = np.exp(1j * 2 * np.pi * 200e3 * t) * mask * 3.5 + 0.1 * (np.random.randn(1024) + 1j * np.random.randn(1024))
-    
-    result = classify_channel(test_iq)
-    print("\nTest Prediction Result:")
-    for k, v in result.items():
-        print(f"  {k}: {v}")
+    import time
+
+    start = time.perf_counter()
+    classifier = RFSignalClassifier().train(samples_per_class=300)
+    elapsed = time.perf_counter() - start
+    print(f"Trained Random Forest in {elapsed:.2f}s")
+    test_signal = generate_hostile_radar()
+    print(classifier.predict(test_signal))
