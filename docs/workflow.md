@@ -1,56 +1,79 @@
-# System Workflow & Development Blueprint
+# DSAS Runtime Workflow
 
-## Part 1: System Runtime Workflow
-*This details the step-by-step data pipeline when the application is actively running.*
+## One sweep from input to dashboard
 
-### 1. Data Ingestion (The Spectrum Generator)
-*   **Action:** `simulator.py` continuously produces batches of synthetic RF data (In-Phase and Quadrature samples).
-*   **Output:** 10 distinct frequency channels, each populated with either pure background noise, civilian signals (Wi-Fi/FM), or hostile signatures (Radar pulses, Jamming).
+### 1. Generate a batch
 
-### 2. Energy Detection (The Scanner)
-*   **Action:** The system calculates the Power Spectral Density (PSD) using a Fast Fourier Transform (FFT) across all 10 channels.
-*   **Logic:** Compares the energy of each channel against a pre-defined ambient noise floor threshold.
+`simulator.generate_spectrum_batch()` creates ten channel records. Each record contains 1,024 complex samples at a 1 MHz sample rate. The default simulator includes background noise, a continuous civilian signal, a radar pulse train, and a broadband jammer so a demo can show all four classes.
 
-### 3. Intelligent Prioritization (The Smart Queue)
-*   **Action:** Channels that exceed the noise floor are extracted.
-*   **Logic:** Instead of scanning sequentially (1 through 10), the system ranks active channels by peak energy and bandwidth, pushing the highest-energy anomalies to the front of the processing queue.
+### 2. Measure channel energy
 
-### 4. Machine Learning Classification (The Threat Engine)
-*   **Action:** `classifier.py` runs a feature extraction pipeline on the prioritized channels (calculating Peak-to-Average Power Ratio, Spectral Flatness, and Bandwidth).
-*   **Logic:** These features are fed into a pre-trained Scikit-Learn Random Forest model.
-*   **Output:** The model returns a classification label (`Hostile Radar`, `Hostile Jammer`, `Civilian`, `Noise`) and a confidence percentage (e.g., 94%).
+For every channel, `scanner.calculate_psd_metrics()` calls `scipy.signal.welch()` with a 256-sample segment. The result includes a two-sided PSD, frequency bins, peak PSD in dB, and mean complex power in dB:
 
-### 5. UI Presentation (The Analyst Dashboard)
-*   **Action:** The Streamlit frontend (`app.py`) retrieves the categorized signals.
-*   **Logic:** 
-    *   Updates a live waterfall/heatmap visualization.
-    *   Pushes `Hostile` classifications to the top of a red-highlighted Threat Feed.
-    *   Allows the analyst to click a specific alert to render its 2D spectrogram and raw waveform.
+```text
+power_db = 10 * log10(mean(abs(iq)**2))
+```
 
----
+The default noise-floor threshold is -10 dB. A threshold slider lets the operator change the comparison without generating new IQ data.
 
-## Part 2: The 4.5-Hour Development Blueprint
-*This is the strict execution plan tailored for AI code generators (Codex, Claude) to build the MVP sequentially.*
+### 3. Classify the signal
 
-### Phase 1: Simulation & DSP Foundation (Minutes 0 - 60)
-**Goal:** Generate the fake data and measure its energy.
-*   **Prompt AI to:** Create `simulator.py`. Implement functions that return 1D NumPy arrays of complex numbers representing the 4 target classes (Noise, FM, Pulsed Radar, Jammer).
-*   **Prompt AI to:** Create `scanner.py`. Write a function that takes the simulator output, runs `scipy.fft.fft`, and returns a dictionary of channels ranked by total energy.
+The classifier converts each IQ array into the fixed nine-value feature vector documented in [current_scope.md](current_scope.md). The vector is standardized and passed to a 100-tree Random Forest with maximum depth 10.
 
-### Phase 2: The Machine Learning Engine (Minutes 60 - 135)
-**Goal:** Extract features and train a fast classifier.
-*   **Prompt AI to:** Create `classifier.py`. Write a function to extract statistical features (variance, kurtosis, peak power, spectral flatness) from the raw NumPy arrays.
-*   **Prompt AI to:** Write a script that generates 1,000 synthetic samples using `simulator.py`, extracts features, and trains a `sklearn.ensemble.RandomForestClassifier`. Save the trained model to memory or a `.joblib` file.
+The four simulated classes map to operational severity as follows:
 
-### Phase 3: The Dashboard UI (Minutes 135 - 225)
-**Goal:** Build the interactive interface using Streamlit and Plotly.
-*   **Prompt AI to:** Create `app.py`. Set up a standard Streamlit layout (`st.set_page_config(layout="wide")`).
-*   **Prompt AI to:** Build three UI components: 
-    1. A wide Plotly line chart acting as the live spectrum viewer.
-    2. A Pandas dataframe rendered via `st.dataframe` for the Threat Alerts.
-    3. A sidebar or expander using `scipy.signal.spectrogram` and `matplotlib`/`plotly` to show the spectrogram of a selected signal.
+| Class | Severity | Status |
+| --- | --- | --- |
+| Hostile Jammer | CRITICAL | BROADBAND JAMMING |
+| Hostile Radar | HIGH | PULSED RADAR LOCK |
+| Civilian Broadcast | LOW | STANDARD COMM |
+| Background Noise | LOW | CLEAR |
 
-### Phase 4: Integration & State Management (Minutes 225 - 270)
-**Goal:** Connect the backend to the frontend and manage the live update loop.
-*   **Prompt AI to:** Implement `st.session_state` to hold the threat log history.
-*   **Prompt AI to:** Add a `st_autorefresh` component or a "Scan Next Batch" button to trigger the simulator -> scanner -> classifier loop, dynamically updating the charts.
+### 4. Compute priority
+
+The scanner combines energy and severity:
+
+```text
+power_excess = max(0, power_db - threshold_db)
+priority = power_excess * threat_multiplier
+```
+
+Multipliers are CRITICAL 2.5, HIGH 1.8, MEDIUM 1.2, and LOW 1.0. This is intentionally simple enough to explain during a demonstration.
+
+### 5. Present results
+
+The dashboard stores the current batch and DataFrame in Streamlit session state. It then renders:
+
+- A power-by-channel bar chart and bounded waterfall history.
+- A ranked threat feed with severity styling.
+- A HIGH/CRITICAL incident log for the current session.
+- I/Q traces and a two-sided STFT for a selected channel.
+
+### 6. Repeat or clear state
+
+Manual Sweep creates a new batch. Changing the threshold re-scores the current batch. Auto-Refresh creates periodic new batches when supported by the installed Streamlit version. Clear Threat Log empties the incident history for the current session; a later scan can create new incidents.
+
+## What the operator should not infer
+
+- A high score is not proof that a real hostile transmitter exists.
+- Model confidence is not a calibrated probability.
+- The simulator's ground-truth class is not available from a real receiver.
+- A channel-level power bar is not the same as a full wideband spectrum plot.
+
+## Failure paths
+
+| Condition | Expected behavior |
+| --- | --- |
+| scikit-learn unavailable | Scanner uses a heuristic fallback and the sidebar says so. |
+| Empty batch | Scanner returns an empty DataFrame with documented columns; UI should show an empty-state message after the next hardening pass. |
+| Invalid/short IQ | Backend raises a clear `ValueError`; UI should convert it to a user-facing message. |
+| Streamlit version lacks fragments | Auto-refresh is not available; the manual sweep remains usable. |
+
+## Development workflow
+
+1. Freeze or update the contracts before changing a module.
+2. Add a deterministic test or fixture for the behavior.
+3. Implement one workstream in its owned files.
+4. Run backend tests and AppTest.
+5. Update the relevant documentation and handoff.
+6. Merge only after the verification gates in [verification_plan.md](verification_plan.md) pass.
