@@ -7,15 +7,24 @@ DSP and classification path it would use for captured IQ samples.
 
 from __future__ import annotations
 
-from typing import Any
+from typing import Any, Protocol
 
 import numpy as np
 
+from config import DEFAULT_CONFIG
 
-DEFAULT_NUM_SAMPLES = 1024
-DEFAULT_SAMPLE_RATE = 1.0e6
-DEFAULT_BASE_FREQUENCY_MHZ = 100.0
-DEFAULT_CHANNEL_SPACING_MHZ = 15.0
+DEFAULT_NUM_SAMPLES = DEFAULT_CONFIG.default_num_samples
+DEFAULT_SAMPLE_RATE = DEFAULT_CONFIG.default_sample_rate
+DEFAULT_BASE_FREQUENCY_MHZ = DEFAULT_CONFIG.default_base_frequency_mhz
+DEFAULT_CHANNEL_SPACING_MHZ = DEFAULT_CONFIG.default_channel_spacing_mhz
+
+
+class ChannelSource(Protocol):
+    """Protocol defining the interface for channel data providers."""
+
+    def read_batch(self) -> dict[int, dict[str, Any]]:
+        """Read a batch of channel signals."""
+        ...
 
 
 def _rng_or_default(rng: np.random.Generator | np.random.RandomState | None) -> Any:
@@ -25,6 +34,7 @@ def _rng_or_default(rng: np.random.Generator | np.random.RandomState | None) -> 
 
 
 def _validate_num_samples(num_samples: int) -> int:
+
     if int(num_samples) != num_samples or num_samples <= 0:
         raise ValueError("num_samples must be a positive integer")
     return int(num_samples)
@@ -215,7 +225,40 @@ def generate_spectrum_batch(
     return channels
 
 
+class SyntheticChannelSource:
+    """ChannelSource adapter that generates synthetic RF spectrum batches."""
+
+    def __init__(
+        self,
+        num_channels: int = 10,
+        num_samples: int = DEFAULT_NUM_SAMPLES,
+        sample_rate: float = DEFAULT_SAMPLE_RATE,
+        base_freq_mhz: float = DEFAULT_BASE_FREQUENCY_MHZ,
+        channel_spacing_mhz: float = DEFAULT_CHANNEL_SPACING_MHZ,
+        seed: int | None = None,
+    ) -> None:
+        self.num_channels = num_channels
+        self.num_samples = num_samples
+        self.sample_rate = sample_rate
+        self.base_freq_mhz = base_freq_mhz
+        self.channel_spacing_mhz = channel_spacing_mhz
+        self.seed = seed
+        self.rng = np.random.default_rng(seed) if seed is not None else None
+
+    def read_batch(self) -> dict[int, dict[str, Any]]:
+        """Return a fresh synthetic spectrum batch."""
+        return generate_spectrum_batch(
+            num_channels=self.num_channels,
+            num_samples=self.num_samples,
+            sample_rate=self.sample_rate,
+            base_freq_mhz=self.base_freq_mhz,
+            channel_spacing_mhz=self.channel_spacing_mhz,
+            rng=self.rng,
+        )
+
+
 if __name__ == "__main__":
+
     batch = generate_spectrum_batch()
     print(f"Generated {len(batch)} channels successfully.")
     for channel_id, channel in batch.items():

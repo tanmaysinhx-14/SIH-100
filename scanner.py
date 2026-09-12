@@ -9,6 +9,8 @@ import numpy as np
 import pandas as pd
 from scipy import signal
 
+from config import DEFAULT_CONFIG
+
 try:
     from classifier import classify_channel
 
@@ -18,7 +20,7 @@ except (ImportError, ModuleNotFoundError):
     HAS_CLASSIFIER = False
 
 
-THREAT_MULTIPLIERS = {"CRITICAL": 2.5, "HIGH": 1.8, "MEDIUM": 1.2, "LOW": 1.0}
+THREAT_MULTIPLIERS = DEFAULT_CONFIG.threat_multipliers
 RESULT_COLUMNS = [
     "Channel",
     "Center Freq (MHz)",
@@ -32,6 +34,61 @@ RESULT_COLUMNS = [
     "Priority Score",
     "Timestamp",
 ]
+
+
+def estimate_noise_floor(channels_dict: dict[Any, dict[str, Any]]) -> float:
+    """Estimate dynamic noise floor threshold (dB) from a batch of channels.
+
+    Calculates mean power across channels, filters extreme outliers, and sets a
+    calibrated threshold with a 3.0 dB margin above baseline noise.
+    """
+    if not channels_dict:
+        return float(DEFAULT_CONFIG.default_noise_threshold_db)
+
+    powers = []
+    for channel in channels_dict.values():
+        if "iq" in channel:
+            iq = np.asarray(channel["iq"], dtype=np.complex128)
+            power_linear = max(float(np.mean(np.abs(iq) ** 2)), np.finfo(float).tiny)
+            powers.append(10.0 * np.log10(power_linear))
+
+    if not powers:
+        return float(DEFAULT_CONFIG.default_noise_threshold_db)
+
+    # Noise floor estimation: 25th percentile of powers plus a 3 dB safety offset
+    baseline_noise_db = float(np.percentile(powers, 25))
+    return round(max(-25.0, min(10.0, baseline_noise_db + 3.0)), 1)
+
+
+def get_priority_breakdown(
+    power_db: float,
+    threshold_db: float,
+    threat_level: str,
+    classification: str,
+) -> dict[str, Any]:
+    """Provide detailed explanation of why a channel received its priority score."""
+    multiplier = THREAT_MULTIPLIERS.get(threat_level, 1.0)
+    power_excess = max(0.0, power_db - threshold_db)
+    priority_score = power_excess * multiplier
+
+    if power_excess <= 0.0:
+        explanation = f"Signal power ({power_db:.1f} dB) is at or below noise floor ({threshold_db:.1f} dB)."
+    else:
+        explanation = (
+            f"Power excess of {power_excess:.1f} dB above threshold ({threshold_db:.1f} dB) "
+            f"scaled by {threat_level} threat multiplier ({multiplier}x) for {classification}."
+        )
+
+    return {
+        "power_db": round(power_db, 2),
+        "threshold_db": round(threshold_db, 2),
+        "power_excess_db": round(power_excess, 2),
+        "threat_level": threat_level,
+        "threat_multiplier": multiplier,
+        "priority_score": round(priority_score, 2),
+        "explanation": explanation,
+    }
+
 
 
 def calculate_psd_metrics(

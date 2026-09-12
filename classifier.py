@@ -9,8 +9,10 @@ from typing import Any
 import numpy as np
 from scipy import signal, stats
 from sklearn.ensemble import RandomForestClassifier
+from sklearn.metrics import accuracy_score, classification_report, confusion_matrix
 from sklearn.preprocessing import StandardScaler
 
+from config import DEFAULT_CONFIG
 from simulator import (
     generate_awgn,
     generate_civilian_signal,
@@ -20,23 +22,9 @@ from simulator import (
 
 
 MODEL_FILE = "rf_signal_model.pkl"
-FEATURE_NAMES = (
-    "Mean Power (dB)",
-    "PAPR (dB)",
-    "Amplitude Std",
-    "Amplitude Kurtosis",
-    "Phase Std",
-    "Instantaneous Frequency Std",
-    "Spectral Flatness",
-    "Spectral Centroid",
-    "Spectral Spread",
-)
-CLASS_LABELS = (
-    "Background Noise",
-    "Civilian Broadcast",
-    "Hostile Radar",
-    "Hostile Jammer",
-)
+FEATURE_NAMES = DEFAULT_CONFIG.feature_names
+CLASS_LABELS = DEFAULT_CONFIG.class_labels
+
 
 
 def _validated_iq(iq_samples: np.ndarray) -> np.ndarray:
@@ -251,8 +239,44 @@ class RFSignalClassifier:
             "features": feature_vector,
         }
 
+    def get_feature_importances(self) -> dict[str, float]:
+        """Return a mapping of feature names to their relative importance scores."""
+        if not self.is_trained:
+            self.train(samples_per_class=100)
+        importances = self.model.feature_importances_
+        return {
+            name: round(float(importance), 4)
+            for name, importance in zip(FEATURE_NAMES, importances)
+        }
+
+    def evaluate_model(
+        self, samples_per_class: int = 100, seed: int = 999
+    ) -> dict[str, Any]:
+        """Evaluate trained model on a held-out synthetic test set."""
+        if not self.is_trained:
+            self.train(samples_per_class=100)
+
+        x_test, y_test = _generate_synthetic_training_data(
+            samples_per_class=samples_per_class, random_state=seed
+        )
+        x_test_scaled = self.scaler.transform(x_test)
+        y_pred = self.model.predict(x_test_scaled)
+
+        acc = float(accuracy_score(y_test, y_pred))
+        report = classification_report(y_test, y_pred, output_dict=True)
+        cm = confusion_matrix(y_test, y_pred, labels=list(CLASS_LABELS))
+
+        return {
+            "accuracy": round(acc, 4),
+            "classification_report": report,
+            "confusion_matrix": cm,
+            "class_labels": list(CLASS_LABELS),
+            "feature_importances": self.get_feature_importances(),
+        }
+
 
 _CLASSIFIER_INSTANCE = RFSignalClassifier()
+
 
 
 def classify_channel(iq_samples: np.ndarray, sample_rate: float = 1.0e6) -> dict[str, Any]:
